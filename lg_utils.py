@@ -3,11 +3,11 @@ import torch
 import os
 import h5py
 from torch.utils.data import TensorDataset, DataLoader
-import tensorflow as tf
+# import tensorflow as tf
 import json
 from typing import Dict
 from glob import glob 
-from constants import DATA_DIR_PATH, FEATURE_DESCRIPTOR, FEATURE2DIM
+# from constants import DATA_DIR_PATH, FEATURE_DESCRIPTOR, FEATURE2DIM
 import cv2
 from tqdm import tqdm
 from visualize_episodes import save_videos
@@ -16,30 +16,33 @@ import IPython
 e = IPython.embed
 
 class EpisodicDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats):
+    def __init__(self, demo_dirs, episode_ids, dataset_dir, camera_names, norm_stats):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids # index of demonstratcion which will included
         self.dataset_dir = dataset_dir
         self.camera_names = camera_names
         self.norm_stats = norm_stats
         self.is_sim = None
+        self.demo_dirs = demo_dirs
         self.__getitem__(0) # initialize self.is_sim
+        # print(f'Found {len(self.demo_dir)} demos')
 
     def __len__(self):
         return len(self.episode_ids)
 
     def __getitem__(self, index):
-        sample_full_episode = False # hardcode
+        sample_full_episode = True # hardcode
 
         episode_id = self.episode_ids[index]
-        dataset_path = os.path.join(self.dataset_dir, f'episode_{episode_id}.hdf5')
+        # dataset_path = os.path.join(self.dataset_dir, f'episode_{episode_id}.hdf5')
+        dataset_path = self.demo_dirs[episode_id]
         min_length = self.norm_stats['min_length']
 
         with h5py.File(dataset_path, 'r') as root:
-            is_sim = root.attrs['sim']
+            # is_sim = root.attrs['sim']
 
             ### cut min_length
-            original_action_shape = root['/action/delta_ee'].shape
+            original_action_shape = root['/action/joint_pos'].shape
             trj_len = original_action_shape[0]
             start = np.random.choice((0, trj_len - min_length))
             end = start + min_length
@@ -50,17 +53,18 @@ class EpisodicDataset(torch.utils.data.Dataset):
             else:
                 start_ts = np.random.choice(min_length)
             # get observation at start_ts only
-            qpos = root['/observations/qpos'][start + start_ts]
+            qpos = root['/observation/joint_pos'][start + start_ts]
             # qvel = root['/observations/qvel'][start_ts]
             image_dict = dict()
             for cam_name in self.camera_names:
-                image_dict[cam_name] = root[f'/observations/images/{cam_name}'][start + start_ts]
+                image_dict[cam_name] = root[f'/observation/{cam_name}'][start + start_ts]
             # get all actions after and including start_ts
+            is_sim = False
             if is_sim:
-                action = root['/action'][start + start_ts:end]
+                action = root['/action/joint_pos'][start + start_ts:end]
                 action_len = min_length - start_ts
             else:
-                action = root['/action'][max(start, start + start_ts - 1):end] # hack, to make timesteps more aligned
+                action = root['/action/joint_pos'][max(start, start + start_ts - 1):end] # hack, to make timesteps more aligned
                 action_len = min_length - max(0, start_ts - 1) # hack, to make timesteps more aligned
 
         self.is_sim = is_sim
@@ -77,8 +81,8 @@ class EpisodicDataset(torch.utils.data.Dataset):
 
         # construct observations
         image_data = torch.from_numpy(all_cam_images)
-        qpos_data = torch.from_numpy(qpos).float()
-        action_data = torch.from_numpy(padded_action).float()
+        qpos_data = torch.from_numpy(qpos).to(torch.float32)
+        action_data = torch.from_numpy(padded_action).to(torch.float32)
         is_pad = torch.from_numpy(is_pad).bool()
 
         # channel last
@@ -89,19 +93,20 @@ class EpisodicDataset(torch.utils.data.Dataset):
         action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
         qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
         # print(image_data.shape, qpos_data.shape, action_data.shape, is_pad.shape)
-        return image_data, qpos_data, action_data, is_pad
+        return image_data.to(torch.float32), qpos_data.to(torch.float32), action_data.to(torch.float32), is_pad
 
 
 def get_norm_stats(dataset_dir, num_episodes):
     all_qpos_data = []
     all_action_data = []
     min_length = 1000000000
-    for episode_idx in range(num_episodes):
-        dataset_path = os.path.join(dataset_dir, f'episode_{episode_idx}.hdf5')
+    demo_dir = glob(f'{dataset_dir}/*.hdf5')
+    for dataset_path in demo_dir:
+        # dataset_path = os.path.join(dataset_dir, f'episode_{episode_idx}.hdf5')
         with h5py.File(dataset_path, 'r') as root:
-            qpos = root['/observations/qpos'][()]
+            qpos = root['/observation/joint_pos'][()]
             # qvel = root['/observations/qvel'][()]
-            action = root['/action'][()]
+            action = root['/action/joint_pos'][()]
             if len(qpos) < min_length:
                 min_length = len(qpos)
         all_qpos_data.append(torch.from_numpy(qpos))
@@ -138,9 +143,11 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     print('Getting Norm Stats')
     norm_stats = get_norm_stats(dataset_dir, num_episodes)
 
+    demo_dirs = glob(f'{dataset_dir}/*.hdf5')
+
     # construct dataset and dataloader
-    train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats)
-    val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats)
+    train_dataset = EpisodicDataset(demo_dirs, train_indices, dataset_dir, camera_names, norm_stats)
+    val_dataset = EpisodicDataset(demo_dirs, val_indices, dataset_dir, camera_names, norm_stats)
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=16, prefetch_factor=4)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=4, prefetch_factor=4)
 
@@ -288,11 +295,3 @@ def detach_dict(d):
 def set_seed(seed):
     torch.manual_seed(seed)
     np.random.seed(seed)
-
-
-
-### Unit test
-if __name__ == "__main__": 
-    # parse_data_robomimic('/home/jellyho/robomimic/datasets/transport/ph/image_ds.hdf5', '../datasets/transport_abs', True)
-    # 
-    rename_hdf5_files('/share0/jellyho/datasets/clean')
